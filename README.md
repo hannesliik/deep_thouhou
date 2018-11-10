@@ -1,4 +1,4 @@
-# Deep Thouhou
+# Deep Touhou
 Using DQN to play touhou
 
 * Uses Win API to read score from memory and modify number of lives.
