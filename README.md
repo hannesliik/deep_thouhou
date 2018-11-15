@@ -12,5 +12,5 @@ Challenges:
 * Observations are not evenly spaced: they are fetched as fast as possible (60fps without any burdening code like running the model to choose an action. Much less otherwise.)
 
 Usage:
-1) Install thouhou 16 and change its path in main.py. (This is tested on the steam demo. Might have different memory addresses for other versions).
+1) Install touhou 16: Hidden Star in Four Seasons and change its path in main.py. (This is tested on the steam demo. Might have different memory addresses for other versions).
 2) Don't run main.py, it's not ready yet :)
