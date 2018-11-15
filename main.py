@@ -15,7 +15,6 @@ import keyboard
 import torch.nn.functional as F
 # In-project imports
 from models import Model
-from recording import create_recording, Recording, get_transition
 from memory_operations import read_memory, write_memory
 from replay_buffer import ReplayBuffer
 
@@ -27,19 +26,19 @@ MONITOR_WINDOW_MARGIN = [35, 2, 2, 2]
 MONITOR_GAME_AREA_RATIO = [0.03, 0.05, 390 / 650, 450 / 480]
 # - Recording settings
 FRAMES_SKIP = 1
-EXPERIENCE_LENGTH = 60 * 60  # aka. experience length
-RECORDING_PATH = "recordings\\"
 
 # - Model settings
-FRAMES_FEED = 5  # How many frames the model should take as input
+FRAMES_FEED = 4  # How many frames the model should take as input
 DEATH_PENALTY = 5000
 KEY_DURATION_SECONDS = 0
 
 # - Training parameters
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 LEARNING_RATE = 0.03
 GAMMA = 0.99
 GRAD_CLIP = 10
+TARGET_MODEL_UPDATE_FREQ = 1500
+TRAIN_FREQ = 64
 
 # - Debug settings
 DEBUG = True
@@ -60,6 +59,7 @@ game_paused = False
 action_stack = []  # Holds the current actions
 DEVICE = torch.device("cpu")
 
+
 class ExplorationScheduler:
     def __init__(self, val=1, decay: float = 0.90, minval: float = 0.02):
         self.val = val
@@ -71,8 +71,9 @@ class ExplorationScheduler:
 
 
 # https://ai.intel.com/demystifying-deep-reinforcement-learning/
-def main_loop(handle, possible_actions: list, model: Model):
+def main_loop(handle, possible_actions: list, model: Model, target_model: Model):
     exp_schedule = ExplorationScheduler()
+    target_model.load_state_dict(model.state_dict())
     optimizer = torch.optim.RMSprop(model.parameters())
     with mss() as sct:
         counter = 0
@@ -99,38 +100,39 @@ def main_loop(handle, possible_actions: list, model: Model):
             # Check if frame will be skipped. Not skipped if counter is 0
             if frame_skip_counter == 0:
                 reward, score, lives = get_reward(handle, lives, score)
+
+                print(action, reward)
                 if replay_buffer.waiting_for_effect:
                     replay_buffer.add_effects(action, reward)
-
+                replay_buffer.push_frame(frame)
                 if replay_buffer.buffer_init() and np.random.random() > exp_schedule.value(t):
                     action = choose_action(replay_buffer.encode_last_frame(), model)
                 else:
                     action = np.random.randint(0, len(possible_actions) - 1)
 
-
                 execute_actions([possible_actions[int(action)], dk.SCANCODES["z"]])
 
                 # Logic to deal with a ready datapoint
-                if replay_buffer.can_sample(BATCH_SIZE):
+                if replay_buffer.can_sample(BATCH_SIZE) and t % TRAIN_FREQ == 0:
                     pause_game()
-                    optimize_model(model, None, replay_buffer, optimizer)
+                    optimize_model(model, target_model, replay_buffer, optimizer, num_actions=len(possible_actions))
+
+                    # Copy model weights to target
+                    if t % TARGET_MODEL_UPDATE_FREQ == 0:
+                        target_model.load_state_dict(model.state_dict())
+                        target_model.eval()
                     pause_game()
-
-
 
             frame_skip_counter += 1
             frame_skip_counter = frame_skip_counter % FRAMES_SKIP
-
-            frame_counter += 1
-            frame_counter = frame_counter % EXPERIENCE_LENGTH
 
             # Frame timings and other utility
             endMillis = time.time()
             frame_time = endMillis - startMillis
             frame_times[counter % 4] = frame_time
             t += 1
-            if counter % 4 == 0:
-                print("frame time: %s" % (np.mean(frame_times)))
+            #if counter % 4 == 0:
+            #    print("frame time: %s" % (np.mean(frame_times)))
             counter += 1
             if cv2.waitKey(25) & 0xFF == ord('q'):
                 cv2.destroyAllWindows()
@@ -154,18 +156,29 @@ def get_reward(handle, lives, score):
         set_lives(handle, 2)
     return reward, new_score, new_lives
 
+
 def one_hot(indexes: torch.LongTensor, depth: int):
-    mask = torch.zeros(indexes.shape[0], depth)
-    mask.scatter(1, indexes, 1)
+    mask = torch.zeros(indexes.shape[0], depth).to(DEVICE)
+    print(indexes.shape)
+    print(mask.shape)
+    print(indexes.unsqueeze(0).shape)
+    #ones = torch.ones(indexes.shape[0], depth).to(DEVICE)
+
+    mask.scatter_(1, indexes.unsqueeze(1), 1.)
     return mask
+
 
 def optimize_model(policy_net: Model, target_net: Model, replay_buffer: ReplayBuffer, optimizer, num_actions):
     """Takes a random batch from :experience_memory and trains the policy_net on it for one iteration"""
     # Sample training data
     obs_batch, actions_batch, rewards_batch, obs_next_batch = replay_buffer.sample(BATCH_SIZE)
+    print(type(actions_batch))
+    actions_batch = torch.from_numpy(actions_batch).to(DEVICE)
+    print(type(actions_batch))
     action_mask = one_hot(actions_batch, num_actions)
     obs_batch_torch = torch.from_numpy(obs_batch).to(DEVICE)
     obs_next_batch_torch = torch.from_numpy(obs_next_batch).to(DEVICE)
+
     q_t_batch = policy_net(obs_batch_torch)
     q_t_ac = torch.sum(q_t_batch * action_mask, dim=1)
 
@@ -175,22 +188,20 @@ def optimize_model(policy_net: Model, target_net: Model, replay_buffer: ReplayBu
         tp1_action_mask = one_hot(q_tp1_actions, num_actions)
 
         q_tp1_target = target_net(obs_next_batch_torch)
-        q_target = rewards_batch + GAMMA * tp1_action_mask * q_tp1_target
+        q_target = rewards_batch + GAMMA * torch.sum(tp1_action_mask * q_tp1_target, dim=1)
 
-    loss = F.smooth_l1_loss(q_t_ac, q_target)
+    loss = F.smooth_l1_loss(q_t_ac, q_target.float().to(DEVICE))
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(policy_net.parameters(), GRAD_CLIP)
     optimizer.step()
 
 
-
-
-
-def choose_action(state, model: Model):
+def choose_action(obs, model: Model):
     if DEBUG and DEBUG_CONTROL:
         print("choose_action")
-    action_scores = model.forward(state)
+    obs_torch = torch.from_numpy(obs).to(DEVICE)
+    action_scores = model.forward(obs_torch.unsqueeze_(0))
     return np.argmax(action_scores.detach().cpu().numpy())
 
 
@@ -200,8 +211,8 @@ def grab_screen(monitor, recorder):
     im = recorder.grab(monitor=monitor)
     im = np.array(im, dtype=np.uint8)
     frame_cv2 = np.flip(im[:, :, :3], 2, ).astype(np.uint8)
-    frame = np.moveaxis(frame_cv2, 2, 0, )
-    return frame, frame_cv2
+    frame = np.moveaxis(frame_cv2, 2, 0, ).astype(np.float32, copy=False) / 255
+    return frame.astype(np.float32, copy=False), frame_cv2
 
 
 def execute_actions(actions):
@@ -225,7 +236,7 @@ def execute_actions(actions):
 
 def release(key):
     """Releases the given key"""
-    if DEBUG:
+    if DEBUG and DEBUG_CONTROL:
         print("release", key)
     global action_stack
     if key in action_stack:
@@ -235,6 +246,8 @@ def release(key):
 
 def press(key, time=0):
     """Presses the key :key for :time seconds. :time 0 is infinite"""
+    if key is None:
+        return
     if DEBUG:
         print("press", key)
     if key not in action_stack:
@@ -328,13 +341,14 @@ def pause(*param):
         print("Pausing.")
     active = not active
 
+
 def pause_game():
     global game_paused
     if game_paused:
         # Resume actions
         dk.PressKey(dk.SCANCODES["ESC"])
+        time.sleep(0.2)
         dk.ReleaseKey(dk.SCANCODES["ESC"])
-        time.sleep(0.5)
         for key in action_stack:
             dk.PressKey(key)
         print("Resuming Game.")
@@ -343,6 +357,7 @@ def pause_game():
         for key in action_stack:
             dk.ReleaseKey(key)
         dk.PressKey(dk.SCANCODES["ESC"])
+        time.sleep(0.2)
         dk.ReleaseKey(dk.SCANCODES["ESC"])
         print("Pausing Game.")
     game_paused = not game_paused
@@ -358,14 +373,15 @@ def main():
     # set_score(adv_handle, 0)
     fit_window()
     possible_actions = [  # dk.SCANCODES["z"], dk.SCANCODES["x"],
+        None,
         dk.SCANCODES["UP"], dk.SCANCODES["DOWN"],
         dk.SCANCODES["LEFT"], dk.SCANCODES["RIGHT"]]
-    model = Model(FRAMES_FEED, len(possible_actions), monitor["width"], monitor['height']).cuda()
-
+    model = Model(FRAMES_FEED, len(possible_actions), monitor["width"], monitor['height']).to(DEVICE)
+    target_model = Model(FRAMES_FEED, len(possible_actions), monitor["width"], monitor['height']).to(DEVICE)
     pause()
     keyboard.on_press_key(" ", pause)
     try:
-        main_loop(adv_handle, possible_actions, model)
+        main_loop(adv_handle, possible_actions, model, target_model)
     finally:
         pass
         # windll.kernel32.CloseHandle(adv_handle)
@@ -380,7 +396,7 @@ def state_reshape(state_with_time_channel):
 
 
 if __name__ == "__main__":
-    global DEVICE
+    # global DEVICE
     if torch.cuda.is_available():
         DEVICE = torch.device("cuda")
     else:

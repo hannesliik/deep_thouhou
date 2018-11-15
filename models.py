@@ -12,8 +12,7 @@ class Model(torch.nn.Module):
         self.fc1 = nn.Linear(20 * (size_x - 8) * (size_y - 8), num_actions, 1)  # A fc layer using an 1x1 convolution
 
     def forward(self, x):
-        print("begin forward")
-        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv1(x.float()))
         x = F.relu(self.conv2(x))
         x = x.view(x.size(0), -1)  # Flatten
         return self.fc1(x)
