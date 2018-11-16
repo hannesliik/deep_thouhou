@@ -1,6 +1,8 @@
 # Deep Touhou
 Using DQN to play touhou
 
+![Hidden Star in Four seasons](https://github.com/hannesliik/deep_thouhou/blob/master/touhou.PNG)
+Work in progress...
 * Uses Win API to read score from memory and modify number of lives.
 * MSS to read screen pixels
 * Pytorch for the Q-Network
@@ -13,4 +15,5 @@ Challenges:
 
 Usage:
 1) Install touhou 16: Hidden Star in Four Seasons and change its path in main.py. (This is tested on the steam demo. Might have different memory addresses for other versions).
-2) Don't run main.py, it's not ready yet :)
+2) Tweak paramaters in main.py
+3) run main.py
