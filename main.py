@@ -172,24 +172,20 @@ def optimize_model(policy_net: Model, target_net: Model, replay_buffer: ReplayBu
     """Takes a random batch from :experience_memory and trains the policy_net on it for one iteration"""
     # Sample training data
     obs_batch, actions_batch, rewards_batch, obs_next_batch = replay_buffer.sample(BATCH_SIZE)
-    print(type(actions_batch))
     actions_batch = torch.from_numpy(actions_batch).to(DEVICE)
-    print(type(actions_batch))
-    action_mask = one_hot(actions_batch, num_actions)
     obs_batch_torch = torch.from_numpy(obs_batch).to(DEVICE)
     obs_next_batch_torch = torch.from_numpy(obs_next_batch).to(DEVICE)
 
     q_t_batch = policy_net(obs_batch_torch)
-    q_t_ac = torch.sum(q_t_batch * action_mask, dim=1)
+    q_t_ac = q_t_batch.gather(1, actions_batch.unsqueeze_(1))
 
     with torch.no_grad():
         q_tp1 = policy_net(obs_next_batch_torch)
         q_tp1_biggest, q_tp1_actions = q_tp1.max(1)
-        tp1_action_mask = one_hot(q_tp1_actions, num_actions)
-
         q_tp1_target = target_net(obs_next_batch_torch)
-        q_target = rewards_batch + GAMMA * torch.sum(tp1_action_mask * q_tp1_target, dim=1)
 
+        q_target = rewards_batch + GAMMA * q_tp1_target.gather(1, q_tp1_actions.unsqueeze(1))
+    print(q_t_ac.shape, q_target.shape)
     loss = F.smooth_l1_loss(q_t_ac, q_target.float().to(DEVICE))
     optimizer.zero_grad()
     loss.backward()
