@@ -8,6 +8,7 @@ import win32.win32gui as wgui
 import re
 import win32process
 import time
+import pickle
 from ctypes import *
 import ctypes.wintypes as wtypes
 import directkeys as dk
@@ -51,6 +52,9 @@ SCORE_ADDR = c_void_p(0x0049E440)
 LIVES_ADDR = c_void_p(0x0049E484)
 TH_PATH = "D:\\Games\\Steam\\steamapps\\common\\th16tr\\th16.exe"
 PROCESS_ALL_ACCESS = 0x1F0FFF
+PAUSE_ON_TRAIN = False
+MODEL_PATH = "latest_model_state.pkl"
+# REFIT_WINDOW = False
 
 # - Global variables
 pid = 0  # Game process id
@@ -61,7 +65,7 @@ DEVICE = torch.device("cpu")
 
 
 class ExplorationScheduler:
-    def __init__(self, val=1, decay: float = 0.90, minval: float = 0.02):
+    def __init__(self, val=0.95, decay: float = 0.9999, minval: float = 0.02):
         self.val = val
         self.decay = decay
         self.min = minval
@@ -91,6 +95,7 @@ def main_loop(handle, possible_actions: list, model: Model, target_model: Model)
                 continue
 
             startMillis = time.time()  # Time
+
             # Grab frames
             frame, frame_cv2 = grab_screen(monitor, sct)
 
@@ -101,27 +106,33 @@ def main_loop(handle, possible_actions: list, model: Model, target_model: Model)
             if frame_skip_counter == 0:
                 reward, score, lives = get_reward(handle, lives, score)
 
-                print(action, reward)
+                # print(action, reward)
                 if replay_buffer.waiting_for_effect:
                     replay_buffer.add_effects(action, reward)
                 replay_buffer.push_frame(frame)
                 if replay_buffer.buffer_init() and np.random.random() > exp_schedule.value(t):
                     action = choose_action(replay_buffer.encode_last_frame(), model)
                 else:
-                    action = np.random.randint(0, len(possible_actions) - 1)
+                    action = np.random.randint(0, len(possible_actions) )
 
-                execute_actions([possible_actions[int(action)], dk.SCANCODES["z"]])
+                execute_actions([possible_actions[int(action)]]),  # dk.SCANCODES["z"]
 
                 # Logic to deal with a ready datapoint
                 if replay_buffer.can_sample(BATCH_SIZE) and t % TRAIN_FREQ == 0:
-                    pause_game()
+                    if PAUSE_ON_TRAIN:
+                        pause_game()
                     optimize_model(model, target_model, replay_buffer, optimizer, num_actions=len(possible_actions))
+                    if PAUSE_ON_TRAIN:
+                        pause_game()
 
-                    # Copy model weights to target
-                    if t % TARGET_MODEL_UPDATE_FREQ == 0:
-                        target_model.load_state_dict(model.state_dict())
-                        target_model.eval()
-                    pause_game()
+                # Copy model weights to target
+                if t % TARGET_MODEL_UPDATE_FREQ == 0:
+                    print("Saving model")
+                    state_dict = model.state_dict()
+                    torch.save(state_dict, MODEL_PATH)
+                    print("done pickling")
+                    target_model.load_state_dict(state_dict)
+                    target_model.eval()
 
             frame_skip_counter += 1
             frame_skip_counter = frame_skip_counter % FRAMES_SKIP
@@ -131,7 +142,7 @@ def main_loop(handle, possible_actions: list, model: Model, target_model: Model)
             frame_time = endMillis - startMillis
             frame_times[counter % 4] = frame_time
             t += 1
-            #if counter % 4 == 0:
+            # if counter % 4 == 0:
             #    print("frame time: %s" % (np.mean(frame_times)))
             counter += 1
             if cv2.waitKey(25) & 0xFF == ord('q'):
@@ -157,17 +168,6 @@ def get_reward(handle, lives, score):
     return reward, new_score, new_lives
 
 
-def one_hot(indexes: torch.LongTensor, depth: int):
-    mask = torch.zeros(indexes.shape[0], depth).to(DEVICE)
-    print(indexes.shape)
-    print(mask.shape)
-    print(indexes.unsqueeze(0).shape)
-    #ones = torch.ones(indexes.shape[0], depth).to(DEVICE)
-
-    mask.scatter_(1, indexes.unsqueeze(1), 1.)
-    return mask
-
-
 def optimize_model(policy_net: Model, target_net: Model, replay_buffer: ReplayBuffer, optimizer, num_actions):
     """Takes a random batch from :experience_memory and trains the policy_net on it for one iteration"""
     # Sample training data
@@ -180,18 +180,17 @@ def optimize_model(policy_net: Model, target_net: Model, replay_buffer: ReplayBu
     q_t_ac = q_t_batch.gather(1, actions_batch.unsqueeze_(1))
 
     with torch.no_grad():
+        rewards_batch_torch = torch.from_numpy(rewards_batch).float().to(DEVICE)
         q_tp1 = policy_net(obs_next_batch_torch)
-        q_tp1_biggest, q_tp1_actions = q_tp1.max(1)
+        q_tp1_maxval, q_tp1_maxind = q_tp1.max(1)
         q_tp1_target = target_net(obs_next_batch_torch)
+        q_target = rewards_batch_torch.unsqueeze_(1) + GAMMA * q_tp1_target.gather(1, q_tp1_maxind.unsqueeze(1))
 
-        q_target = rewards_batch + GAMMA * q_tp1_target.gather(1, q_tp1_actions.unsqueeze(1))
-    print(q_t_ac.shape, q_target.shape)
     loss = F.smooth_l1_loss(q_t_ac, q_target.float().to(DEVICE))
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(policy_net.parameters(), GRAD_CLIP)
     optimizer.step()
-
 
 def choose_action(obs, model: Model):
     if DEBUG and DEBUG_CONTROL:
@@ -244,7 +243,7 @@ def press(key, time=0):
     """Presses the key :key for :time seconds. :time 0 is infinite"""
     if key is None:
         return
-    if DEBUG:
+    if DEBUG and DEBUG_CONTROL:
         print("press", key)
     if key not in action_stack:
         action_stack.append(key)
@@ -368,10 +367,10 @@ def main():
     # set_lives(adv_handle, 0)
     # set_score(adv_handle, 0)
     fit_window()
-    possible_actions = [  # dk.SCANCODES["z"], dk.SCANCODES["x"],
-        None,
-        dk.SCANCODES["UP"], dk.SCANCODES["DOWN"],
-        dk.SCANCODES["LEFT"], dk.SCANCODES["RIGHT"]]
+    possible_actions = [dk.SCANCODES["z"],  # dk.SCANCODES["x"],
+                        None,
+                        dk.SCANCODES["UP"], dk.SCANCODES["DOWN"],
+                        dk.SCANCODES["LEFT"], dk.SCANCODES["RIGHT"]]
     model = Model(FRAMES_FEED, len(possible_actions), monitor["width"], monitor['height']).to(DEVICE)
     target_model = Model(FRAMES_FEED, len(possible_actions), monitor["width"], monitor['height']).to(DEVICE)
     pause()
@@ -393,7 +392,8 @@ def state_reshape(state_with_time_channel):
 
 if __name__ == "__main__":
     # global DEVICE
-    if torch.cuda.is_available():
+    gpu = True
+    if torch.cuda.is_available() and gpu:
         DEVICE = torch.device("cuda")
     else:
         DEVICE = torch.device("cpu")
