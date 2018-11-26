@@ -17,3 +17,7 @@ Usage:
 1) Install touhou 16: Hidden Star in Four Seasons and change its path in main.py. (This is tested on the steam demo. Might have different memory addresses for other versions).
 2) Tweak paramaters in main.py
 3) run main.py
+
+Interesting observations so far:
+* Learns that shooting gives reward and doesn't like to do anything else.
+* Once learned that going up brings more reward than shooting (there is a boundary above which all points are collected automatically).
