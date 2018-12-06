@@ -1,0 +1,7 @@
+* Observations/state transitions are correlated
+  - sample state transitions sparsely?
+* The most important decision points (where we have to dodge bullets) are sparse and might not be sampled for training.
+  - Make sampling important transitions more likely. Tried weighting by reward,
+    but doesn't seem to work too good or needs tuning.
+  - Save transition with a probability that is dependant on the near future reward (next reward or reward of a few next steps)
+* Infinite horizon case. Use higher gamma?
