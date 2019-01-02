@@ -1,20 +1,24 @@
 from threading import Timer
-import numpy as np
-import torch
 import os
-import cv2
-from mss import mss
-import win32.win32gui as wgui
 import re
-import win32process
 import time
 import pickle
 from ctypes import *
 import ctypes.wintypes as wtypes
-import directkeys as dk
+from collections import deque
+
+# Library imports
+import numpy as np
+import torch
+import cv2
+from mss import mss
+import win32.win32gui as wgui
+import win32process
 import keyboard
 import torch.nn.functional as F
+
 # In-project imports
+import directkeys as dk
 from models import Model
 from memory_operations import read_memory, write_memory
 from replay_buffer import ReplayBuffer
@@ -29,17 +33,20 @@ MONITOR_GAME_AREA_RATIO = [0.03, 0.05, 390 / 650, 450 / 480]
 FRAMES_SKIP = 1
 
 # - Model settings
-FRAMES_FEED = 4  # How many frames the model should take as input
+FRAMES_FEED = 3  # How many frames the model should take as input
 DEATH_PENALTY = 5000
 KEY_DURATION_SECONDS = 0
 
 # - Training parameters
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 LEARNING_RATE = 0.03
-GAMMA = 0.99
+GAMMA = 0.9
 GRAD_CLIP = 10
 TARGET_MODEL_UPDATE_FREQ = 1500
-TRAIN_FREQ = 64
+TRAIN_FREQ = 128
+BATCHES_PER_TRAIN = 5
+REPLAY_BUFFER_SIZE = 500
+N_STEP_REWARD = 3
 
 # - Debug settings
 DEBUG = True
@@ -52,8 +59,11 @@ SCORE_ADDR = c_void_p(0x0049E440)
 LIVES_ADDR = c_void_p(0x0049E484)
 TH_PATH = "D:\\Games\\Steam\\steamapps\\common\\th16tr\\th16.exe"
 PROCESS_ALL_ACCESS = 0x1F0FFF
-PAUSE_ON_TRAIN = False
+PAUSE_ON_TRAIN = True
+LOAD_MODEL = False
 MODEL_PATH = "latest_model_state.pkl"
+RESIZE_HEIGHT = 200
+RESIZE_WIDTH = 120
 # REFIT_WINDOW = False
 
 # - Global variables
@@ -65,7 +75,7 @@ DEVICE = torch.device("cpu")
 
 
 class ExplorationScheduler:
-    def __init__(self, val=0.95, decay: float = 0.9999, minval: float = 0.02):
+    def __init__(self, val=0.95, decay: float = 0.999, minval: float = 0.02):
         self.val = val
         self.decay = decay
         self.min = minval
@@ -86,7 +96,12 @@ def main_loop(handle, possible_actions: list, model: Model, target_model: Model)
         score = 0
         lives = 3
         frame_times = [0, 0, 0, 0]
-        replay_buffer = ReplayBuffer(200, (3 * FRAMES_FEED, monitor['height'], monitor['width']), FRAMES_FEED)
+        replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE,
+                                     (3 * FRAMES_FEED, RESIZE_HEIGHT, RESIZE_WIDTH),
+                                     FRAMES_FEED,
+                                     baseline_priority=1,
+                                     gamma=GAMMA,
+                                     reward_steps=N_STEP_REWARD)
         t = 0
         action = 0
         while True:
@@ -113,7 +128,7 @@ def main_loop(handle, possible_actions: list, model: Model, target_model: Model)
                 if replay_buffer.buffer_init() and np.random.random() > exp_schedule.value(t):
                     action = choose_action(replay_buffer.encode_last_frame(), model)
                 else:
-                    action = np.random.randint(0, len(possible_actions) )
+                    action = np.random.randint(0, len(possible_actions))
 
                 execute_actions([possible_actions[int(action)]]),  # dk.SCANCODES["z"]
 
@@ -121,7 +136,8 @@ def main_loop(handle, possible_actions: list, model: Model, target_model: Model)
                 if replay_buffer.can_sample(BATCH_SIZE) and t % TRAIN_FREQ == 0:
                     if PAUSE_ON_TRAIN:
                         pause_game()
-                    optimize_model(model, target_model, replay_buffer, optimizer, num_actions=len(possible_actions))
+                    for _ in range(BATCHES_PER_TRAIN):
+                        optimize_model(model, target_model, replay_buffer, optimizer, num_actions=len(possible_actions))
                     if PAUSE_ON_TRAIN:
                         pause_game()
 
@@ -165,38 +181,45 @@ def get_reward(handle, lives, score):
     if new_lives == 1:
         # Add a life to extend play time
         set_lives(handle, 2)
+    reward -= 1  # Discourage idleness
     return reward, new_score, new_lives
 
 
 def optimize_model(policy_net: Model, target_net: Model, replay_buffer: ReplayBuffer, optimizer, num_actions):
     """Takes a random batch from :experience_memory and trains the policy_net on it for one iteration"""
     # Sample training data
-    obs_batch, actions_batch, rewards_batch, obs_next_batch = replay_buffer.sample(BATCH_SIZE)
-    actions_batch = torch.from_numpy(actions_batch).to(DEVICE)
-    obs_batch_torch = torch.from_numpy(obs_batch).to(DEVICE)
-    obs_next_batch_torch = torch.from_numpy(obs_next_batch).to(DEVICE)
+    obs_batch, actions_batch, rewards_batch, obs_next_batch, sample_ix = replay_buffer.sample(BATCH_SIZE)
+    actions_batch: torch.Tensor = torch.from_numpy(actions_batch).to(DEVICE)
+    obs_batch_torch: torch.Tensor = torch.from_numpy(obs_batch).to(DEVICE)
+    obs_next_batch_torch: torch.Tensor = torch.from_numpy(obs_next_batch).to(DEVICE)
 
     q_t_batch = policy_net(obs_batch_torch)
     q_t_ac = q_t_batch.gather(1, actions_batch.unsqueeze_(1))
-
+    print(obs_next_batch_torch.shape)
     with torch.no_grad():
         rewards_batch_torch = torch.from_numpy(rewards_batch).float().to(DEVICE)
         q_tp1 = policy_net(obs_next_batch_torch)
-        q_tp1_maxval, q_tp1_maxind = q_tp1.max(1)
+        _, q_tp1_maxind = q_tp1.max(1)
         q_tp1_target = target_net(obs_next_batch_torch)
         q_target = rewards_batch_torch.unsqueeze_(1) + GAMMA * q_tp1_target.gather(1, q_tp1_maxind.unsqueeze(1))
 
-    loss = F.smooth_l1_loss(q_t_ac, q_target.float().to(DEVICE))
+    errors: torch.Tensor = F.smooth_l1_loss(q_t_ac, q_target.float().to(DEVICE), reduction='none')
+    loss = errors.mean(dim=0)
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(policy_net.parameters(), GRAD_CLIP)
     optimizer.step()
+    # Update replay buffer priorities
+    print(errors.shape)
+    replay_buffer.add_errors(sample_ix, errors.detach().squeeze_().cpu().numpy())
+
 
 def choose_action(obs, model: Model):
     if DEBUG and DEBUG_CONTROL:
         print("choose_action")
-    obs_torch = torch.from_numpy(obs).to(DEVICE)
-    action_scores = model.forward(obs_torch.unsqueeze_(0))
+    with torch.no_grad():
+        obs_torch = torch.from_numpy(obs).to(DEVICE)
+        action_scores = model.forward(obs_torch.unsqueeze_(0))
     return np.argmax(action_scores.detach().cpu().numpy())
 
 
@@ -205,6 +228,7 @@ def grab_screen(monitor, recorder):
     :returns @frame and opencv compatible @frame_cv2"""
     im = recorder.grab(monitor=monitor)
     im = np.array(im, dtype=np.uint8)
+    im = cv2.resize(im, (RESIZE_WIDTH, RESIZE_HEIGHT))
     frame_cv2 = np.flip(im[:, :, :3], 2, ).astype(np.uint8)
     frame = np.moveaxis(frame_cv2, 2, 0, ).astype(np.float32, copy=False) / 255
     return frame.astype(np.float32, copy=False), frame_cv2
@@ -371,8 +395,10 @@ def main():
                         None,
                         dk.SCANCODES["UP"], dk.SCANCODES["DOWN"],
                         dk.SCANCODES["LEFT"], dk.SCANCODES["RIGHT"]]
-    model = Model(FRAMES_FEED, len(possible_actions), monitor["width"], monitor['height']).to(DEVICE)
-    target_model = Model(FRAMES_FEED, len(possible_actions), monitor["width"], monitor['height']).to(DEVICE)
+    model = Model(FRAMES_FEED, len(possible_actions), RESIZE_WIDTH, RESIZE_HEIGHT).to(DEVICE)
+    if LOAD_MODEL:
+        model.load_state_dict(torch.load(MODEL_PATH))
+    target_model = Model(FRAMES_FEED, len(possible_actions), RESIZE_WIDTH, RESIZE_HEIGHT).to(DEVICE)
     pause()
     keyboard.on_press_key(" ", pause)
     try:
