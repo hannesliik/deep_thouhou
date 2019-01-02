@@ -73,9 +73,14 @@ game_paused = False
 action_stack = []  # Holds the current actions
 DEVICE = torch.device("cpu")
 
+DATA_GATHERING_MODE = False # Set true to record a dataset
+DATA_GATHERING_N_FRAMES = 4  # every Nth frame will be saved
+DATA_GATHERING_SAVE_RATE = 1024  # When N frames are captured, save to disk
+
+MEAN, STD = [0.41650942, 0.3781172,  0.3798624], [0.29010016, 0.2663686, 0.26838425]
 
 class ExplorationScheduler:
-    def __init__(self, val=0.95, decay: float = 0.999, minval: float = 0.02):
+    def __init__(self, val=0.95, decay: float = 0.999, minval: float = 0.05):
         self.val = val
         self.decay = decay
         self.min = minval
@@ -89,9 +94,10 @@ def main_loop(handle, possible_actions: list, model: Model, target_model: Model)
     exp_schedule = ExplorationScheduler()
     target_model.load_state_dict(model.state_dict())
     optimizer = torch.optim.RMSprop(model.parameters())
+    if DATA_GATHERING_MODE:
+        frames = []
     with mss() as sct:
         counter = 0
-        frame_counter = 0
         frame_skip_counter = 0
         score = 0
         lives = 3
@@ -113,7 +119,16 @@ def main_loop(handle, possible_actions: list, model: Model, target_model: Model)
 
             # Grab frames
             frame, frame_cv2 = grab_screen(monitor, sct)
+            if DATA_GATHERING_MODE:
 
+                t += 1
+                print(t)
+                if t % DATA_GATHERING_N_FRAMES == 0:
+                    frames.append(frame)
+                    if len(frames) == 2000:
+                        np.save(f"frames_{t}", np.array(frames))
+                        frames = []
+                continue
             # Show frame
             if DEBUG:
                 cv2.imshow('window1', frame_cv2)
@@ -396,6 +411,7 @@ def main():
                         dk.SCANCODES["UP"], dk.SCANCODES["DOWN"],
                         dk.SCANCODES["LEFT"], dk.SCANCODES["RIGHT"]]
     model = Model(FRAMES_FEED, len(possible_actions), RESIZE_WIDTH, RESIZE_HEIGHT).to(DEVICE)
+    model.encoder.load_state_dict(torch.load("encoder_state_dict.pth"))
     if LOAD_MODEL:
         model.load_state_dict(torch.load(MODEL_PATH))
     target_model = Model(FRAMES_FEED, len(possible_actions), RESIZE_WIDTH, RESIZE_HEIGHT).to(DEVICE)
