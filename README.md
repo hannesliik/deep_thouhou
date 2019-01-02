@@ -7,7 +7,7 @@ Work in progress...
 * MSS to read screen pixels
 * Pytorch for the Q-Network
 * Emulates key presses that touhou will recognize
-* OpenCV to visualize the observations
+* OpenCV to resize and visualize the observations
 
 Challenges:
 * Replay buffer takes a LOT of memory for raw images.
