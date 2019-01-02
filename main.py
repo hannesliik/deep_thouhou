@@ -1,20 +1,24 @@
 from threading import Timer
-import numpy as np
-import torch
 import os
-import cv2
-from mss import mss
-import win32.win32gui as wgui
 import re
-import win32process
 import time
 import pickle
 from ctypes import *
 import ctypes.wintypes as wtypes
-import directkeys as dk
+from collections import deque
+
+# Library imports
+import numpy as np
+import torch
+import cv2
+from mss import mss
+import win32.win32gui as wgui
+import win32process
 import keyboard
 import torch.nn.functional as F
+
 # In-project imports
+import directkeys as dk
 from models import Model
 from memory_operations import read_memory, write_memory
 from replay_buffer import ReplayBuffer
@@ -36,12 +40,13 @@ KEY_DURATION_SECONDS = 0
 # - Training parameters
 BATCH_SIZE = 16
 LEARNING_RATE = 0.03
-GAMMA = 0.998
+GAMMA = 0.9
 GRAD_CLIP = 10
 TARGET_MODEL_UPDATE_FREQ = 1500
 TRAIN_FREQ = 128
 BATCHES_PER_TRAIN = 5
 REPLAY_BUFFER_SIZE = 500
+N_STEP_REWARD = 3
 
 # - Debug settings
 DEBUG = True
@@ -91,7 +96,12 @@ def main_loop(handle, possible_actions: list, model: Model, target_model: Model)
         score = 0
         lives = 3
         frame_times = [0, 0, 0, 0]
-        replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE, (3 * FRAMES_FEED, RESIZE_HEIGHT, RESIZE_WIDTH), FRAMES_FEED, baseline_priority=1)
+        replay_buffer = ReplayBuffer(REPLAY_BUFFER_SIZE,
+                                     (3 * FRAMES_FEED, RESIZE_HEIGHT, RESIZE_WIDTH),
+                                     FRAMES_FEED,
+                                     baseline_priority=1,
+                                     gamma=GAMMA,
+                                     reward_steps=N_STEP_REWARD)
         t = 0
         action = 0
         while True:
@@ -118,7 +128,7 @@ def main_loop(handle, possible_actions: list, model: Model, target_model: Model)
                 if replay_buffer.buffer_init() and np.random.random() > exp_schedule.value(t):
                     action = choose_action(replay_buffer.encode_last_frame(), model)
                 else:
-                    action = np.random.randint(0, len(possible_actions) )
+                    action = np.random.randint(0, len(possible_actions))
 
                 execute_actions([possible_actions[int(action)]]),  # dk.SCANCODES["z"]
 
@@ -171,7 +181,7 @@ def get_reward(handle, lives, score):
     if new_lives == 1:
         # Add a life to extend play time
         set_lives(handle, 2)
-    reward -= 1 # Discourage idleness
+    reward -= 1  # Discourage idleness
     return reward, new_score, new_lives
 
 
@@ -202,6 +212,7 @@ def optimize_model(policy_net: Model, target_net: Model, replay_buffer: ReplayBu
     # Update replay buffer priorities
     print(errors.shape)
     replay_buffer.add_errors(sample_ix, errors.detach().squeeze_().cpu().numpy())
+
 
 def choose_action(obs, model: Model):
     if DEBUG and DEBUG_CONTROL:
