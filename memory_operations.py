@@ -25,4 +25,5 @@ def read_memory(handle, address, buffer, bytes_to_read):
         return buffer, bytes_read
     else:
         print("Memory read failed, Error:", windll.kernel32.GetLastError())
+        exit()
         return buffer, bytes_read
