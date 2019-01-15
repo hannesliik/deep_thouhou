@@ -13,6 +13,11 @@ Challenges:
 * Replay buffer takes a LOT of memory for raw images.
 * Observations are not evenly spaced: they are fetched as fast as possible (60fps without any burdening code like running the model to choose an action. Much less otherwise.)
 
+Functionality:
+* N-step returns
+* Prioritized replay (based on latest error)
+* Autoencoder pretraining
+
 Usage:
 1) Install touhou 16: Hidden Star in Four Seasons and change its path in main.py. (This is tested on the steam demo. Might have different memory addresses for other versions).
 2) Tweak paramaters in main.py
